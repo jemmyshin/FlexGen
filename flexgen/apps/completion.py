@@ -19,6 +19,11 @@ def main(args):
         "Airport codes: JFK, SFO.\n"
         "Text: \"I want you to book a flight from Phoenix to Las Vegas.\"\n"
         "Airport codes:",
+
+        "Question: What's the value of 2 * 3?\n"
+        "Answer: 6\n"
+        "Question: What's the value of 100 * 100?\n"
+        "Answer:",
     ]
 
     # Initialize environment
@@ -52,7 +57,8 @@ def main(args):
     print("Generate...")
     inputs = tokenizer(prompts, padding="max_length", max_length=128)
     output_ids = model.generate(
-        inputs.input_ids,
+        inputs=inputs.input_ids,
+        query_embeddings=None,
         do_sample=True,
         temperature=0.7,
         max_new_tokens=32,

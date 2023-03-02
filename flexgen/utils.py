@@ -22,6 +22,7 @@ T = 1e12
 class Task:
     """A generation task."""
     inputs: Union[np.array, List[List[int]]]
+    query_embeddings: torch.Tensor
     prompt_len: int
     gen_len: int
     cut_gen_len: Optional[int]
