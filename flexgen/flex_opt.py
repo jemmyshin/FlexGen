@@ -178,7 +178,7 @@ class InputEmbed:
         return (batch_size, seq_len), np.int64
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, query_embeddings=None):
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
@@ -190,8 +190,22 @@ class InputEmbed:
         else:
             (w_token, _), (w_pos, _) = weight_read_buf.val
 
+        if i == 0:
+            print(f"Input Embed =====>  mask: {mask}")
+            print(f"Input Embed =====>  h: {h.data[0]}")
+            print(f"Input Embed =====>  h: {h.data[1]}")
+            print(f"Input Embed =====>  h: {h.data[2]}")
         h = self.compute.opt_input_embed(h, mask,
-            w_token, w_pos, self.config.pad_token_id, donate)
+                w_token, w_pos, self.config.pad_token_id, donate)
+
+        if i == 0:
+            # concat query_embeddings from qformer and input_ids for language model
+            # this **ONLY** apply on the first generation step
+            print(f"Input Embed =====>  h: {h.data.shape}")
+            for idx, _h in enumerate(h):
+                first_token_index = list(map(lambda x:x == self.config.pad_token_id, _h.data)).index(False)
+                _h.data[first_token_index - query_embeddings.shape[1] : first_token_index] = query_embeddings[idx]
+        #    print(f"After Input Embed =====>  h: {h.data[0,:10,:5]}, {h.data[0,10:,:5]}")
         hidden.val = h
 
 
@@ -780,11 +794,19 @@ class OptLM:
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
 
-    def compute_layer(self, i, j, k):
+    def compute_layer(self, i, j, k, query_embeddings=None):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
+
+        # this **ONLY** apply on the first generation step 
+        if query_embeddings:
+            self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k, query_embeddings)
+            return
+
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k)
@@ -823,6 +845,7 @@ class OptLM:
 
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
+                 query_embeddings: torch.Tensor,
                  max_new_tokens: int = 32,
                  do_sample: bool = False,
                  temperature: float = 1.0,
@@ -832,6 +855,7 @@ class OptLM:
                  verbose: int = 0):
         task = Task(
             inputs=inputs,
+            query_embeddings=query_embeddings,
             prompt_len=len(inputs[0]),
             gen_len=max_new_tokens,
             cut_gen_len=cut_gen_len,
@@ -851,6 +875,8 @@ class OptLM:
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        print(f"task.inputs: {task.inputs}")
+        print(f"before generate, the output_ids: {self.output_ids}")
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
         # Intermediate tensors
