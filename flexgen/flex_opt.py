@@ -66,6 +66,9 @@ class Policy:
     compress_cache: bool
     comp_cache_config: CompressionConfig
 
+    # Replace InputEmbed Layer
+    replace_input_embed: bool
+
     @property
     def w_disk_percent(self):
         return 100 - self.w_gpu_percent - self.w_cpu_percent
@@ -198,7 +201,7 @@ class InputEmbed:
         h = self.compute.opt_input_embed(h, mask,
                 w_token, w_pos, self.config.pad_token_id, donate)
 
-        if i == 0:
+        if i == 0 and self.policy.replace_input_embed:
             # concat query_embeddings from qformer and input_ids for language model
             # this **ONLY** apply on the first generation step
             print(f"Input Embed =====>  h: {h.data.shape}")
@@ -801,7 +804,7 @@ class OptLM:
         # Run layer computation
 
         # this **ONLY** apply on the first generation step 
-        if query_embeddings:
+        if query_embeddings and self.policy.replace_input_embed:
             self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k, query_embeddings)
@@ -906,22 +909,22 @@ class OptLM:
         if debug_mode is None:
             if not overlap:
                 # No overlap, easy to understand, suitable for debugging
-                self.generation_loop_normal()
+                self.generation_loop_normal(query_embeddings)
             else:
                 # Overlap I/O and compute
                 if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch()
+                    self.generation_loop_overlap_single_batch(query_embeddings)
                 else:
-                    self.generation_loop_overlap_multi_batch()
+                    self.generation_loop_overlap_multi_batch(query_embeddings)
         elif debug_mode == "fewer_batch":
             # Run fewer layeres and batches for debugging
             if num_gpu_batches == 1:
-                self.generation_loop_debug_single_batch()
+                self.generation_loop_debug_single_batch(query_embeddings)
             else:
-                self.generation_loop_debug_multi_batch()
+                self.generation_loop_debug_multi_batch(query_embeddings)
         elif debug_mode == "breakdown":
             # No overlap, fewer batches, execution time breakdown
-            self.generation_loop_debug_normal()
+            self.generation_loop_debug_normal(query_embeddings)
         else:
             raise ValueError("Invalid debug mode: {debug_mode}")
 
@@ -934,7 +937,7 @@ class OptLM:
 
         return self.output_ids
 
-    def generation_loop_normal(self):
+    def generation_loop_normal(self, query_embeddings):
         for i in range(self.execute_gen_len):
             timers("generate").start()
             for k in range(self.num_gpu_batches):
@@ -946,12 +949,15 @@ class OptLM:
                 for k in range(self.num_gpu_batches):
                     self.load_cache(i, j, k, overlap=False)
                     self.load_hidden(i, j, k)
-                    self.compute_layer(i, j, k)
+                    if i == 0 and j == 0 and self.policy.replace_input_embed:
+                        self.compute_layer(i, j, k, query_embeddings)
+                    else:
+                        self.compute_layer(i, j, k)
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
             timers("generate").stop()
 
-    def generation_loop_debug_normal(self):
+    def generation_loop_debug_normal(self, query_embeddings):
         execute_num_batches = 20
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
@@ -995,7 +1001,10 @@ class OptLM:
                     load_cache_timer.stop(self.sync)
                     self.load_hidden(i, j, k)
                     compute_layer_timer.start(self.sync)
-                    self.compute_layer(i, j, k)
+                    if i == 0 and j == 0 and self.policy.replace_input_embed:
+                        self.compute_layer(i, j, k, query_embeddings)
+                    else:
+                        self.compute_layer(i, j, k)
                     compute_layer_timer.stop(self.sync)
                     self.store_hidden(i, j, k)
                     store_cache_timer.start(self.sync)
@@ -1033,7 +1042,7 @@ class OptLM:
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
-    def generation_loop_overlap_single_batch(self):
+    def generation_loop_overlap_single_batch(self, query_embeddings):
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1047,7 +1056,10 @@ class OptLM:
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
                 self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
+                if i == 0 and j == 0 and self.policy.replace_input_embed:
+                    self.compute_layer(i, j, 0, query_embeddings)
+                else:
+                    self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
@@ -1056,7 +1068,7 @@ class OptLM:
             if self.task.stop and np.all(self.stopped):
                 break
 
-    def generation_loop_overlap_multi_batch(self):
+    def generation_loop_overlap_multi_batch(self, query_embeddings):
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1074,7 +1086,10 @@ class OptLM:
                     self.load_cache(i, j, k+1)
                     self.store_hidden(i, j, k-1)
                     self.load_hidden(i, j, k+1)
-                    self.compute_layer(i, j, k)
+                    if i == 0 and j == 0 and self.policy.replace_input_embed:
+                        self.compute_layer(i, j, k, query_embeddings)
+                    else:
+                        self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
                     self.sync()
             timers("generate").stop()
@@ -1083,7 +1098,7 @@ class OptLM:
         self.store_hidden(
             self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
 
-    def generation_loop_debug_single_batch(self):
+    def generation_loop_debug_single_batch(self, query_embeddings):
         execute_num_batches = 20
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
@@ -1104,7 +1119,10 @@ class OptLM:
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
                 self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
+                if i == 0 and j == 0 and self.policy.replace_input_embed:
+                    self.compute_layer(i, j, 0, query_embeddings)
+                else:
+                    self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
@@ -1125,7 +1143,7 @@ class OptLM:
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
-    def generation_loop_debug_multi_batch(self):
+    def generation_loop_debug_multi_batch(self, query_embeddings):
         execute_num_batches = 20
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
@@ -1150,7 +1168,10 @@ class OptLM:
                     self.load_cache(i, j, k+1)
                     self.store_hidden(i, j, k-1)
                     self.load_hidden(i, j, k+1)
-                    self.compute_layer(i, j, k)
+                    if i == 0 and j == 0 and self.policy.replace_input_embed:
+                        self.compute_layer(i, j, k, query_embeddings)
+                    else:
+                        self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
                     self.sync()
 

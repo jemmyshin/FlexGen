@@ -8,23 +8,30 @@ from transformers import AutoTokenizer
 
 def main(args):
     # Prompts
-    prompts = [
-        "Question: Where were the 2004 Olympics held?\n"
-        "Answer: Athens, Greece\n"
-        "Question: What is the longest river on the earth?\n"
-        "Answer:",
+    # prompts = [
+    #     "Question: Where were the 2004 Olympics held?\n"
+    #     "Answer: Athens, Greece\n"
+    #     "Question: What is the longest river on the earth?\n"
+    #     "Answer:",
+    #
+    #     "Extract the airport codes from this text.\n"
+    #     "Text: \"I want a flight from New York to San Francisco.\"\n"
+    #     "Airport codes: JFK, SFO.\n"
+    #     "Text: \"I want you to book a flight from Phoenix to Las Vegas.\"\n"
+    #     "Airport codes:",
+    #
+    #     "Question: What's the value of 2 * 3?\n"
+    #     "Answer: 6\n"
+    #     "Question: What's the value of 100 * 100?\n"
+    #     "Answer:",
+    # ]
 
-        "Extract the airport codes from this text.\n"
-        "Text: \"I want a flight from New York to San Francisco.\"\n"
-        "Airport codes: JFK, SFO.\n"
-        "Text: \"I want you to book a flight from Phoenix to Las Vegas.\"\n"
-        "Airport codes:",
-
-        "Question: What's the value of 2 * 3?\n"
-        "Answer: 6\n"
-        "Question: What's the value of 100 * 100?\n"
-        "Answer:",
-    ]
+    import torch
+    # only used for test,these are outputs from qformer of BLIP2 model
+    # input_ids
+    prompts = torch.load('./prompts')
+    # query_embeddings
+    query_embeddings = torch.load('./query_embeddings')
 
     # Initialize environment
     env = ExecutionEnv.create(args.offload_dir)
@@ -43,22 +50,35 @@ def main(args):
                     compress_cache=args.compress_cache,
                     comp_cache_config=CompressionConfig(
                         num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
+                        group_dim=2, symmetric=False),
+                    replace_input_embed=True)
 
     # Model
     print("Initialize...")
-    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-    tokenizer.add_bos_token = False
+    if not policy.replace_input_embed:
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer.add_bos_token = False
+    else:
+        from transformers import Blip2Processor
+        tokenizer = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
     stop = tokenizer("\n").input_ids[0]
 
     model = OptLM(args.model, env, args.path, policy)
 
     # Generate
     print("Generate...")
-    inputs = tokenizer(prompts, padding="max_length", max_length=128)
+    if not policy.replace_input_embed:
+        input_ids = tokenizer(prompts, padding="max_length", max_length=128).input_ids
+    else:
+        input_ids = []
+        for prompt in prompts:
+            padding_index = prompt.index(1)
+            prompt = prompt[:padding_index]
+            padding = [1]*(128 - prompt)
+            input_ids.append([*padding, *prompt])
     output_ids = model.generate(
-        inputs=inputs.input_ids,
-        query_embeddings=None,
+        inputs=input_ids,
+        query_embeddings=query_embeddings,
         do_sample=True,
         temperature=0.7,
         max_new_tokens=32,
